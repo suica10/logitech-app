@@ -99,8 +99,8 @@ class HIDPPDevice:
         self._dev.open_path(self._path)
         self._dev.set_nonblocking(False)
 
-        self._inbox = queue.Queue()       # everything received
         self._notifications = queue.Queue()  # unsolicited messages only
+        self._pending = None  # (feature_index, function, swid, result_queue)
         self._stop = False
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
@@ -112,13 +112,39 @@ class HIDPPDevice:
     # ------------------------------------------------------------------ I/O
 
     def _reader_loop(self):
+        # Route every incoming message: a reply matching the pending
+        # request goes to that request's queue; EVERYTHING else is an
+        # unsolicited notification. (v0.1 bug: messages were queued into a
+        # single inbox that only request() drained, so notifications never
+        # surfaced while the app was idle.)
         while not self._stop:
             try:
                 data = self._dev.read(64, 200)
             except Exception:
                 return
-            if data:
-                self._inbox.put(bytes(data))
+            if not data:
+                continue
+            data = bytes(data)
+            pending = self._pending
+            if pending is not None and self._matches(pending, data):
+                pending[3].put(data)
+            else:
+                self._notifications.put(data)
+
+    def _matches(self, pending, r):
+        feature_index, function, swid, _q = pending
+        if len(r) < 5:
+            return False
+        # Error reply: byte2 == 0x8F, byte4 = original fn|swid
+        if r[2] == 0x8F and (r[4] & 0x0F) == swid:
+            return True
+        return (
+            r[0] == REPORT_LONG
+            and r[1] == self.device_index
+            and r[2] == feature_index
+            and (r[3] & 0x0F) == swid
+            and (r[3] >> 4) == function
+        )
 
     def close(self):
         self._stop = True
@@ -143,32 +169,21 @@ class HIDPPDevice:
             msg[2] = feature_index
             msg[3] = (function << 4) | swid
             msg[4:4 + len(params)] = params
-            self._dev.write(bytes(msg))
 
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    r = self._inbox.get(timeout=max(0.05, deadline - time.time()))
-                except queue.Empty:
-                    break
-                if len(r) < 5:
-                    self._notifications.put(r)
-                    continue
-                # Error reply: byte2 == 0x8F, byte4 = original fn|swid, byte5 = code
-                if r[2] == 0x8F and (r[4] & 0x0F) == swid:
-                    raise HIDPPError(r[5], f"(feature idx {feature_index}, fn {function})")
-                if (
-                    r[0] == REPORT_LONG
-                    and r[1] == self.device_index
-                    and r[2] == feature_index
-                    and (r[3] & 0x0F) == swid
-                    and (r[3] >> 4) == function
-                ):
-                    return bytes(r[4:])
-                self._notifications.put(r)
-            raise HIDPPTimeout(
-                f"no reply: feature idx {feature_index}, fn {function}"
-            )
+            result_q = queue.Queue()
+            self._pending = (feature_index, function, swid, result_q)
+            try:
+                self._dev.write(bytes(msg))
+                r = result_q.get(timeout=timeout)
+            except queue.Empty:
+                raise HIDPPTimeout(
+                    f"no reply: feature idx {feature_index}, fn {function}"
+                )
+            finally:
+                self._pending = None
+            if r[2] == 0x8F:
+                raise HIDPPError(r[5], f"(feature idx {feature_index}, fn {function})")
+            return bytes(r[4:])
 
     def poll_notification(self, timeout=0.0):
         """Return one unsolicited message (raw bytes) or None."""
