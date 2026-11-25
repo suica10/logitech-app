@@ -1,4 +1,4 @@
-Set wmi = GetObject("winmgts:\\.\root\cimv2")
+Set wmi = GetObject("winmgmts:\\.\root\cimv2")
 Set procs = wmi.ExecQuery("SELECT * FROM Win32_Process WHERE Name='python.exe' OR Name='pythonw.exe'")
 running = False
 For Each p In procs
