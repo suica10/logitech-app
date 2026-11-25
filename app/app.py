@@ -1,4 +1,4 @@
-"""MX Master 2S per-app button remapper (Logi Options+ replacement, v0.1).
+"""MX Master 2S per-app button remapper (Logi Options+ replacement, v0.2).
 
 Resident loop:
 - Connects to the mouse over HID++ (see hidpp.py) and diverts the thumb /
@@ -9,6 +9,15 @@ Resident loop:
 - The gesture button (0xC3) accumulates raw XY deltas while held; on release
   the dominant direction (or a tap) selects the mapping.
 - On exit, the original CID reporting flags are restored exactly.
+
+Pointer speed (v0.2):
+- A single virtual slider (1..40) drives Windows pointer speed (1..20)
+  and the mouse DPI together (see speed.py): 20 = Windows GUI maximum,
+  40 = twice that. The setting lives in config.json ("pointer") and is
+  re-applied at startup.
+- Settings window: hidden; creating show_gui.flag next to this file (the
+  desktop launcher does that) pops it up. Closing the window hides it;
+  the resident app keeps running.
 
 Usage:
     python app.py [--config config.json] [--dry-run] [--seconds N]
@@ -24,6 +33,7 @@ import logging
 import os
 import struct
 import sys
+import threading
 import time
 from ctypes import wintypes
 
@@ -33,6 +43,7 @@ from hidpp import (  # noqa: E402
     FEATURE_REPROG_CONTROLS_V4,
     HIDPPDevice,
 )
+import speed as pspeed  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Buttons (CIDs measured on the real device, 2026-11-24)
@@ -164,7 +175,13 @@ def load_config(path):
         cfg = json.load(f)
     cfg.setdefault("default", {})
     cfg.setdefault("apps", {})
+    cfg.setdefault("pointer", {})
     return cfg
+
+
+def save_config(path, cfg):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=1)
 
 
 def lookup(cfg, exe, action):
@@ -178,6 +195,142 @@ def lookup(cfg, exe, action):
     return cfg["default"].get(action) or None
 
 
+# --------------------------------------------------------------------------
+# Pointer speed: apply / adopt, state file for headless verification
+
+def write_state(here, **kw):
+    path = os.path.join(here, "state.json")
+    try:
+        state = {}
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+        state.update(kw)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def apply_pointer(dev, cfg, config_path, here, log, virtual=None):
+    """Apply a virtual speed (or the saved one) to Windows + the mouse.
+
+    Returns the virtual value in effect. Raises on device/OS errors;
+    callers decide whether that is fatal.
+    """
+    if virtual is None:
+        virtual = int(cfg["pointer"]["virtual"])
+    win, dpi = pspeed.virtual_to_pair(virtual)
+    pspeed.set_win_speed(win)
+    got_x, got_y = dev.set_dpi(dpi, dpi)
+    cfg["pointer"] = {"virtual": virtual, "win_speed": win, "dpi_x": dpi}
+    save_config(config_path, cfg)
+    write_state(here, connected=True, virtual=virtual, win_speed=win,
+                dpi_x=got_x, dpi_y=got_y)
+    log.info("pointer: virtual %d -> win %d, dpi %d (read back %d/%d)",
+             virtual, win, dpi, got_x, got_y)
+    return virtual
+
+
+def adopt_pointer(dev, cfg, config_path, here, log):
+    """First run: take the live state as the slider position, change
+    nothing, and persist it so later startups re-apply it."""
+    dpi_x, dpi_y = dev.get_dpi()
+    win = pspeed.get_win_speed()
+    virtual = pspeed.nearest_virtual(dpi_x, win)
+    cfg["pointer"] = {"virtual": virtual, "win_speed": win, "dpi_x": dpi_x}
+    save_config(config_path, cfg)
+    write_state(here, connected=True, virtual=virtual, win_speed=win,
+                dpi_x=dpi_x, dpi_y=dpi_y)
+    log.info("pointer: adopted live state win %d dpi %d -> virtual %d",
+             win, dpi_x, virtual)
+    return virtual
+
+
+# --------------------------------------------------------------------------
+# Settings window (Tk). Hidden until show_gui.flag appears.
+
+class SettingsWindow:
+    def __init__(self, root, dev, cfg, config_path, here, log, virtual):
+        import tkinter as tk
+
+        self.tk = tk
+        self.root = root
+        self.dev = dev
+        self.cfg = cfg
+        self.config_path = config_path
+        self.here = here
+        self.log = log
+        self.flag_path = os.path.join(here, "show_gui.flag")
+
+        root.title("MX Master 2S 設定")
+        root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", root.withdraw)
+
+        frame = tk.Frame(root, padx=16, pady=12)
+        frame.pack()
+
+        tk.Label(frame, text="カーソル速度").pack(anchor="w")
+        self.var = tk.IntVar(value=virtual)
+        self.scale = tk.Scale(
+            frame, from_=1, to=pspeed.VIRTUAL_MAX, orient="horizontal",
+            variable=self.var, showvalue=False, length=440,
+            command=self._on_slide)
+        self.scale.pack()
+        self.scale.bind("<ButtonRelease-1>", self._on_release)
+
+        marks = tk.Frame(frame)
+        marks.pack(fill="x")
+        tk.Label(marks, text="遅い").pack(side="left")
+        tk.Label(marks, text="2倍").pack(side="right")
+        tk.Label(marks, text="Windows最大").pack(side="right", padx=(0, 118))
+
+        self.readout = tk.Label(frame, text="")
+        self.readout.pack(anchor="w", pady=(8, 0))
+        self._update_readout(virtual)
+
+        root.withdraw()
+        root.after(400, self._poll_flag)
+
+    def _pair_text(self, v):
+        win, dpi = pspeed.virtual_to_pair(v)
+        return (f"{v / pspeed.WIN_MAX:.2f} 倍　"
+                f"（DPI {dpi} × Windows速度 {win}、実効 {pspeed.effective(v):,.0f}）")
+
+    def _update_readout(self, v):
+        self.readout.config(text=self._pair_text(int(v)))
+
+    def _on_slide(self, value):
+        self._update_readout(int(float(value)))
+
+    def _on_release(self, _event):
+        v = int(self.var.get())
+        try:
+            apply_pointer(self.dev, self.cfg, self.config_path,
+                          self.here, self.log, virtual=v)
+        except Exception as e:  # noqa: BLE001
+            self.log.error("pointer apply failed: %s", e)
+        self._update_readout(v)
+
+    def _poll_flag(self):
+        if os.path.exists(self.flag_path):
+            try:
+                os.remove(self.flag_path)
+            except OSError:
+                pass
+            # Refresh the slider from the persisted setting.
+            v = int(self.cfg.get("pointer", {}).get("virtual", self.var.get()))
+            self.var.set(v)
+            self._update_readout(v)
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            write_state(self.here, gui_shown_at=time.time())
+        self.root.after(400, self._poll_flag)
+
+
+# --------------------------------------------------------------------------
+
 def main():
     ap = argparse.ArgumentParser()
     here = os.path.dirname(os.path.abspath(__file__))
@@ -186,6 +339,8 @@ def main():
                     help="log actions instead of injecting keys")
     ap.add_argument("--seconds", type=int, default=0,
                     help="auto-exit after N seconds (0 = forever)")
+    ap.add_argument("--no-gui", action="store_true",
+                    help="run headless (no settings window)")
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -199,24 +354,113 @@ def main():
     log.info("config loaded: %s (default=%d keys, apps=%s)",
              args.config, len(cfg["default"]), list(cfg["apps"].keys()))
 
-    dev = HIDPPDevice(device_index=1)
+    # Startup retry: at logon the receiver/mouse may not be ready yet
+    # (USB still enumerating, mouse asleep). Retry the whole connect +
+    # divert setup for up to ~3 minutes instead of dying instantly.
+    dev = None
     original_flags = {}
+    reprog_idx = None
+    for attempt in range(36):
+        try:
+            dev = HIDPPDevice(device_index=1)
+            proto = dev.ping()
+            name = dev.device_name()
+            level, status = dev.battery()
+            log.info("connected: %s (HID++ %d.%d), battery %d%% status %d",
+                     name, proto[0], proto[1], level, status)
+            reprog_idx = dev.feature_index(FEATURE_REPROG_CONTROLS_V4)
+
+            for cid in DIVERT_CIDS:
+                flags = dev.get_cid_reporting(cid)
+                original_flags[cid] = flags
+                if not flags & CID_FLAG_DIVERTED:
+                    dev.set_diverted(cid, True)
+                log.info("divert set: CID 0x%04x (flags 0x%02x -> diverted)",
+                         cid, flags)
+            break
+        except Exception as e:  # noqa: BLE001
+            log.warning("connect attempt %d failed: %s", attempt + 1, e)
+            if dev is not None:
+                for cid, flags in original_flags.items():
+                    try:
+                        dev.set_diverted(cid, bool(flags & CID_FLAG_DIVERTED))
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    dev.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            dev = None
+            original_flags = {}
+            time.sleep(5)
+    if dev is None:
+        log.error("could not connect to the mouse after retries; exiting")
+        return
+
+    # Pointer speed: re-apply the saved setting; on first run adopt the
+    # live state without changing anything.
+    virtual = None
     try:
-        proto = dev.ping()
-        name = dev.device_name()
-        level, status = dev.battery()
-        log.info("connected: %s (HID++ %d.%d), battery %d%% status %d",
-                 name, proto[0], proto[1], level, status)
-        reprog_idx = dev.feature_index(FEATURE_REPROG_CONTROLS_V4)
+        if cfg["pointer"].get("virtual"):
+            virtual = apply_pointer(dev, cfg, args.config, here, log)
+        else:
+            virtual = adopt_pointer(dev, cfg, args.config, here, log)
+    except Exception as e:  # noqa: BLE001
+        log.warning("pointer setup failed (continuing): %s", e)
 
-        for cid in DIVERT_CIDS:
-            flags = dev.get_cid_reporting(cid)
-            original_flags[cid] = flags
-            if not flags & CID_FLAG_DIVERTED:
-                dev.set_diverted(cid, True)
-            log.info("divert set: CID 0x%04x (flags 0x%02x -> diverted)",
-                     cid, flags)
+    stop_gui = threading.Event()
 
+    def resident_loop():
+        try:
+            run_loop(dev, original_flags, cfg, args, log)
+        finally:
+            stop_gui.set()
+
+    thread = threading.Thread(target=resident_loop, daemon=True)
+    thread.start()
+
+    if args.no_gui:
+        thread.join()
+        return
+
+    try:
+        import tkinter as tk
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:  # noqa: BLE001
+            pass
+        root = tk.Tk()
+    except Exception as e:  # noqa: BLE001
+        log.warning("GUI unavailable (%s); running headless", e)
+        thread.join()
+        return
+
+    if virtual is None:
+        virtual = pspeed.nearest_virtual(*_live_pair(dev))
+    SettingsWindow(root, dev, cfg, args.config, here, log, virtual)
+
+    def watch_exit():
+        if stop_gui.is_set():
+            root.destroy()
+            return
+        root.after(300, watch_exit)
+
+    root.after(300, watch_exit)
+    root.mainloop()
+    log.info("bye")
+
+
+def _live_pair(dev):
+    try:
+        dpi_x, _ = dev.get_dpi()
+        return dpi_x, pspeed.get_win_speed()
+    except Exception:  # noqa: BLE001
+        return pspeed.BASE_DPI, 10
+
+
+def run_loop(dev, original_flags, cfg, args, log):
+    reprog_idx = dev.feature_index(FEATURE_REPROG_CONTROLS_V4)
+    try:
         deadline = time.time() + args.seconds if args.seconds else None
         current_exe = None
         last_fg_check = 0.0
@@ -287,7 +531,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 log.error("failed to restore CID 0x%04x: %s", cid, e)
         dev.close()
-        log.info("bye")
+        log.info("loop done")
 
 
 def classify_gesture(dx, dy):

@@ -91,12 +91,30 @@ C:\Users\admin\logi\venv\Scripts\python.exe C:\Users\admin\logi\app\verify.py
 `config.json` also contains an app entry with an empty name: rename its key
 to your CAD app's exe name and fill in that app's actions.
 
+## Pointer speed + settings window (v0.2, 2026-11-25)
+
+- One virtual slider (1..40) drives Windows pointer speed (1..20) and the
+  mouse DPI together (see `speed.py`): 20 = Windows GUI maximum at base
+  DPI 2000, 40 = twice that (Windows 20 x DPI 4000, the hardware ceiling).
+  21..40 keep Windows at 20 and raise the DPI; 1..19 keep DPI 2000 and
+  lower the Windows speed. Effective speed is monotonic in the slider.
+- The setting is stored in `config.json` under `pointer` and re-applied
+  at startup (the 2S does not retain DPI across power cycles on its own;
+  left alone it falls back to 1000). On first run the app adopts the live
+  state without changing anything.
+- The settings window is hidden. The desktop launcher
+  (`MXマウス設定.bat` -> `show_gui.vbs`) creates `show_gui.flag` next to
+  `app.py`; the app polls for it and pops the window up. Closing the
+  window hides it; the resident app keeps running. Dragging applies on
+  release. `state.json` mirrors the live pointer state for headless
+  checks.
+
 ## Known limits (v0.1)
 
 - One device only: the MX Master 2S on slot 1 of the Unifying receiver.
   Bluetooth connection is not handled.
 - If Options+ is running at the same time, both receive the diverted events
   and Options+ may re-assert its own divert settings; expect to run one or
-  the other. (Pointer speed is safe either way — this tool never writes it.)
+  the other. (Since v0.2 this tool owns the pointer speed; see above.)
 - The main wheel, thumb wheel and clicks are not remapped (standard HID).
 - Gesture classification is a simple dominant-axis threshold.
