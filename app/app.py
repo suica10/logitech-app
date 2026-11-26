@@ -464,6 +464,7 @@ def run_loop(dev, original_flags, cfg, args, log):
         deadline = time.time() + args.seconds if args.seconds else None
         current_exe = None
         last_fg_check = 0.0
+        last_divert_check = 0.0
         gesture = None  # [sum_dx, sum_dy] while the gesture button is held
         pressed = set()  # CIDs currently reported as pressed
 
@@ -479,6 +480,21 @@ def run_loop(dev, original_flags, cfg, args, log):
                 if exe != current_exe:
                     current_exe = exe
                     log.info("foreground: %s", exe or "(unknown)")
+
+            # Watchdog: the mouse's divert state is volatile and resets
+            # when the mouse sleeps / power-cycles / switches channel.
+            # Re-check every 10 s and re-apply, otherwise the remapping
+            # silently dies while this loop keeps running.
+            if now - last_divert_check > 10.0:
+                last_divert_check = now
+                try:
+                    for cid in DIVERT_CIDS:
+                        if not dev.get_cid_reporting(cid) & CID_FLAG_DIVERTED:
+                            dev.set_diverted(cid, True)
+                            log.info("watchdog: re-applied divert for "
+                                     "CID 0x%04x", cid)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("watchdog divert check failed: %s", e)
 
             msg = dev.poll_notification(timeout=0.05)
             if msg is None or len(msg) < 6:
